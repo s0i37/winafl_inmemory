@@ -1,3 +1,27 @@
+## My little changes
+
+Inspired http://shell-storm.org/blog/In-Memory-fuzzing-with-Pin/
+
+Many of applications can not be fuzzed through traditional AFL approach. For example windows services require initial procedure. In same time WINAFL not deliver fuzz data into target process. It makes the tested application through stdin/readfile or sockets. However, firstly, it is a bit slow method (IO subsystem), and secondly not all application get user input directly.
+
+### Steps to reproduce
+
+Run any target application, for example:
+
+`inmemory.exe`
+
+Instrument blackbox application through https://github.com/s0i37/DBI/blob/master/pin/winafl/fuzz.cpp using RVA offsets:
+
+`pin.exe -pid 1234 -t c:\path\to\PIN\winafl\fuzz.dll -module inmemory.exe -entry 0x13 -exit 0xd1`
+
+Interact with application to entering to infinity loop.
+
+Run winafl:
+
+`afl-fuzz.exe -i in -o out -t 1000 -- banner`
+
+Average fuzz speed ~30000/s iteration in trivial example
+
 # WinAFL
 
 ```
