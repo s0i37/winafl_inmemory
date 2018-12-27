@@ -20,7 +20,7 @@ Run winafl:
 
 `afl-fuzz.exe -i in -o out -t 1000 -- banner`
 
-Average fuzz speed ~30000/s iteration in trivial example
+Average fuzz speed ~20000/s iteration in trivial example
 
 # WinAFL
 
