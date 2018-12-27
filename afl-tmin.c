@@ -82,7 +82,10 @@ static u32 in_len,                    /* Input data length                 */
 static u64 mem_limit = MEM_LIMIT;     /* Memory limit (MB)                 */
 
 static HANDLE shm_handle;             /* Handle of the SHM region         */
-static HANDLE pipe_handle;            /* Handle of the name pipe          */
+HANDLE pipe_sync_handle;              /* Handle of the name pipe          */
+HANDLE pipe_data_handle;              /* Handle for transfer fuzzed data  */
+OVERLAPPED pipe_overlapped;           /* Overlapped structure of pipe     */
+
 static u64    name_seed;              /* Random integer to have a unique shm/pipe name */
 static HANDLE devnul_handle;          /* Handle of the nul device         */
 static u8     sinkhole_stds = 1;      /* Sink-hole stdout/stderr messages?*/
@@ -227,6 +230,7 @@ char *alloc_printf(const char *_str, ...) {
 
 static void remove_shm(void) {
 
+  return;
   UnmapViewOfFile(trace_bits);
   CloseHandle(shm_handle);
   if (prog_in) unlink(prog_in); /* Ignore errors */
@@ -252,21 +256,15 @@ static void setup_shm(void) {
       fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
     }
 
-    shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
-
-    shm_handle = CreateFileMapping(
-                   INVALID_HANDLE_VALUE,    // use paging file
-                   NULL,                    // default security
-                   PAGE_READWRITE,          // read/write access
-                   0,                       // maximum object size (high-order DWORD)
-                   MAP_SIZE,                // maximum object size (low-order DWORD)
-                   (char *)shm_str);        // name of mapping object
+    shm_handle = OpenFileMapping(
+                  FILE_MAP_ALL_ACCESS,      // read/write access
+                  FALSE,                    // do not inherit the name
+                  (char *) "afl_shm_default");
 
     if(shm_handle == NULL) {
       if(GetLastError() == ERROR_ALREADY_EXISTS) {
         // We need another attempt to find a unique section name
         attempts++;
-        ck_free(shm_str);
         ck_free(fuzzer_id);
         fuzzer_id = NULL;
         continue;
@@ -286,7 +284,6 @@ static void setup_shm(void) {
 
   atexit(remove_shm);
 
-  ck_free(shm_str);
 
   trace_bits = (u8 *)MapViewOfFile(
     shm_handle,          // handle to map object
@@ -298,6 +295,47 @@ static void setup_shm(void) {
 
   if (!trace_bits) PFATAL("MapViewOfFile() failed");
 
+}
+
+static void setup_ipc(void)
+{
+  /* open existed pipe */
+  pipe_sync_handle = CreateFile(
+         "\\\\.\\pipe\\afl_sync",   // pipe name
+         GENERIC_READ |  // read and write access
+         GENERIC_WRITE,
+         0,              // no sharing
+         NULL,           // default security attributes
+         OPEN_EXISTING,  // opens existing pipe
+         0,              // default attributes
+         NULL);          // no template file
+
+  if (pipe_sync_handle == INVALID_HANDLE_VALUE) {
+    FATAL("CreateFile failed, GLE=%d.\n", GetLastError());
+  }
+
+  ZeroMemory(&pipe_overlapped, sizeof(pipe_overlapped));
+  
+  pipe_overlapped.hEvent = CreateEvent(
+    NULL,    // default security attribute 
+    TRUE,    // manual-reset event 
+    TRUE,    // initial state = signaled 
+    NULL);   // unnamed event object 
+
+  /* open existed pipe */
+  pipe_data_handle = CreateFile(
+         "\\\\.\\pipe\\afl_data",   // pipe name
+         GENERIC_READ |             // read and write access
+         GENERIC_WRITE,
+         0,                         // no sharing
+         NULL,                      // default security attributes
+         OPEN_EXISTING,             // opens existing pipe
+         0,                         // default attributes
+         NULL);                     // no template file
+
+  if (pipe_data_handle == INVALID_HANDLE_VALUE) {
+    FATAL("CreateFile failed, GLE=%d.\n", GetLastError());
+  };
 }
 
 
@@ -450,8 +488,10 @@ static void create_target_process(char** argv) {
   STARTUPINFO si;
   PROCESS_INFORMATION pi;
 
+  return;
   pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
 
+  /*
   pipe_handle = CreateNamedPipe(
     pipe_name,                // pipe name
     PIPE_ACCESS_DUPLEX,       // read/write access
@@ -465,6 +505,7 @@ static void create_target_process(char** argv) {
   if (pipe_handle == INVALID_HANDLE_VALUE) {
     FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
   }
+  */
 
   target_cmd = argv_to_cmd(argv);
 
@@ -535,11 +576,13 @@ static void create_target_process(char** argv) {
   watchdog_timeout_time = get_cur_time() + exec_tmout;
   watchdog_enabled = 1;
 
+  /*
   if (!ConnectNamedPipe(pipe_handle, NULL)) {
     if (GetLastError() != ERROR_PIPE_CONNECTED) {
       FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
     }
   }
+  */
 
   watchdog_enabled = 0;
 
@@ -576,6 +619,7 @@ static void destroy_target_process(int wait_exit) {
   BOOL still_alive = TRUE;
   STARTUPINFO si;
   PROCESS_INFORMATION pi;
+  return;
 
   EnterCriticalSection(&critical_section);
 
@@ -640,12 +684,14 @@ static void destroy_target_process(int wait_exit) {
 
   leave:
   //close the pipe
+  /*
   if(pipe_handle) {
     DisconnectNamedPipe(pipe_handle);
     CloseHandle(pipe_handle);
 
     pipe_handle = NULL;
   }
+  */
 
   LeaveCriticalSection(&critical_section);
 }
@@ -663,6 +709,36 @@ DWORD WINAPI watchdog_timer( LPVOID lpParam ) {
   }
 }
 
+char ReadCommandFromPipe(u32 timeout)
+{
+  DWORD num_read;
+  char result = 0;
+
+  SAYF("[debug] ReadFile(pipe_sync_handle)\n");
+  if (ReadFile(pipe_sync_handle, &result, 1, &num_read, &pipe_overlapped) || GetLastError() == ERROR_IO_PENDING)
+  {
+    SAYF("[debug] WaitForSingleObject(timeout)\n");
+    if (WaitForSingleObject(pipe_overlapped.hEvent, timeout) != WAIT_OBJECT_0) {
+      // took longer than specified timeout or other error - cancel read
+      CancelIo(pipe_sync_handle);
+      SAYF("[debug] WaitForSingleObject(INFINITE)\n");
+      WaitForSingleObject(pipe_overlapped.hEvent, INFINITE); //wait for cancelation to finish properly.
+      result = 0;
+    }
+  }
+
+  //ACTF("ReadFile GLE %d", GetLastError());
+  //ACTF("read from pipe '%c'", result);
+  return result;
+}
+
+/* данные не всегда передаются!! */
+void WriteDataToPipe(void* mem, u32 len)
+{
+  DWORD num_written;
+  WriteFile(pipe_data_handle, mem, len, &num_written, NULL);
+//  SAYF("[debug] wrote %d bytes\n", num_written);
+}
 
 static void setup_watchdog_timer() {
   watchdog_enabled = 0;
@@ -681,14 +757,31 @@ static int is_child_running() {
 
 static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
-  char command[] = "F";
-  DWORD num_read;
+  //char command[] = "F";
+  //DWORD num_read;
   char result = 0;
   u8 child_crashed;
   u32 cksum;
 
   write_to_file(prog_in, mem, len);
 
+  memset(trace_bits, 0, MAP_SIZE);
+  /* 0 байт передавать нельзя! */
+  WriteDataToPipe(mem, len);
+  result = ReadCommandFromPipe(1000); /* WAIT */
+  switch(result)
+  {
+    case 'K':
+      break;
+    case 'C':
+      child_crashed = 1;
+      break;
+    default:
+      child_timed_out = 1;
+      break;
+  }
+
+  /*
   if(!is_child_running()) {
     destroy_target_process(0);
     create_target_process(argv);
@@ -717,7 +810,9 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
     1,            // number of bytes to write
     &num_read,    // number of bytes written
     NULL);        // not overlapped I/O
+  */
 
+  /*
   watchdog_timeout_time = get_cur_time() + exec_tmout;
 
   if(exec_tmout) {
@@ -732,6 +827,7 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
   MemoryBarrier();
 
+  */
   /* Clean up bitmap, analyze exit condition, etc. */
 
   classify_counts(trace_bits);
@@ -739,16 +835,18 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
   total_execs++;
   fuzz_iterations_current++;
 
+  /*
   if(fuzz_iterations_current == fuzz_iterations_max) {
     destroy_target_process(2000);
   }
+  */
 
   if (stop_soon) {
     SAYF(cRST cLRD "\n+++ Minimization aborted by user +++\n" cRST);
     exit(1);
   }
 
-  child_crashed = result == 'C';
+  //child_crashed = result == 'C';
 
   /* Always discard inputs that time out. */
 
@@ -846,6 +944,7 @@ static void minimize(char** argv) {
       memcpy(tmp_buf, in_data, in_len);
       memset(tmp_buf + set_pos, '0', use_len);
 
+      SAYF("[debug] minimize1()\n");
       res = run_target(argv, tmp_buf, in_len, 0);
 
       if (res) {
@@ -919,6 +1018,7 @@ next_del_blksize:
     /* Tail */
     memcpy(tmp_buf + del_pos, in_data + del_pos + del_len, tail_len);
 
+    SAYF("[debug] minimize2()\n");
     res = run_target(argv, tmp_buf, del_pos + tail_len, 0);
 
     if (res) {
@@ -977,6 +1077,7 @@ next_del_blksize:
     for (r = 0; r < in_len; r++)
       if (tmp_buf[r] == i) tmp_buf[r] = '0';
 
+    SAYF("[debug] minimize3()\n");
     res = run_target(argv, tmp_buf, in_len, 0);
 
     if (res) {
@@ -1013,6 +1114,7 @@ next_del_blksize:
     if (orig == '0') continue;
     tmp_buf[i] = '0';
 
+    SAYF("[debug] minimize4()\n");
     res = run_target(argv, tmp_buf, in_len, 0);
 
     if (res) {
@@ -1411,16 +1513,17 @@ int main(int argc, char** argv) {
 
   if(!in_file || !out_file) usage(argv[0]);
   if(!drioless) {
-    if(optind == argc || !dynamorio_dir) usage(argv[0]);
+    if(optind == argc) usage(argv[0]);
   }
 
-  extract_client_params(argc, argv);
+  //extract_client_params(argc, argv);
   optind++;
 
   if (getenv("AFL_NO_SINKHOLE")) sinkhole_stds = 0;
   if (getenv("AFL_TMIN_EXACT")) exact_mode = 1;
 
   setup_shm();
+  setup_ipc();
   setup_watchdog_timer();
   setup_signal_handlers();
 
@@ -1438,6 +1541,7 @@ int main(int argc, char** argv) {
   ACTF("Performing dry run (mem limit = %llu MB, timeout = %u ms%s)...",
        mem_limit, exec_tmout, edges_only ? ", edges only" : "");
 
+  SAYF("[debug] main()\n");
   run_target(use_argv, in_data, in_len, 1);
 
   if (child_timed_out)
