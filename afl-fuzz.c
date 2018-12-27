@@ -124,9 +124,8 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
            out_dir_fd = -1;           /* FD of the lock file              */
 
 HANDLE child_handle, child_thread_handle;
-char *dynamorio_dir;
 char *client_params;
-int fuzz_iterations_max = 5000, fuzz_iterations_current;
+int fuzz_iterations_max = 5000;
 
 CRITICAL_SECTION critical_section;
 u64 watchdog_timeout_time;
@@ -141,7 +140,8 @@ static u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
 static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
 
 static HANDLE shm_handle;             /* Handle of the SHM region         */
-static HANDLE pipe_handle;            /* Handle of the name pipe          */
+static HANDLE pipe_sync_handle;       /* Handle of the name pipe for signaling */
+static HANDLE pipe_data_handle;       /* Handle of the name pipe for transfer fuzz data */
 static OVERLAPPED pipe_overlapped;    /* Overlapped structure of pipe     */
 
 static char   *fuzzer_id = NULL;      /* The fuzzer ID or a randomized 
@@ -1381,7 +1381,6 @@ static void cull_queue(void) {
 
 static void setup_shm(void) {
 
-  char* shm_str;
   unsigned int seeds[2];
   u64 name_seed;
   u8 attempts = 0;
@@ -1400,15 +1399,11 @@ static void setup_shm(void) {
       fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
     }
 
-    shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
-
-    shm_handle = CreateFileMapping(
-                   INVALID_HANDLE_VALUE,    // use paging file
-                   NULL,                    // default security
-                   PAGE_READWRITE,          // read/write access
-                   0,                       // maximum object size (high-order DWORD)
-                   MAP_SIZE,                // maximum object size (low-order DWORD)
-                   (char *)shm_str);        // name of mapping object
+    /* open existed shared memory */
+    shm_handle = OpenFileMapping(
+                   FILE_MAP_ALL_ACCESS,   // read/write access
+                   FALSE,                 // do not inherit the name
+                   (char *)"afl_shm_default");
 
     if(shm_handle == NULL) {
       if(sync_id) {
@@ -1418,7 +1413,6 @@ static void setup_shm(void) {
       if(GetLastError() == ERROR_ALREADY_EXISTS) {
         // We need another attempt to find a unique section name
         attempts++;
-        ck_free(shm_str);
         ck_free(fuzzer_id);
         fuzzer_id = NULL;
         continue;
@@ -1437,8 +1431,6 @@ static void setup_shm(void) {
   }
 
   atexit(remove_shm);
-
-  ck_free(shm_str);
 
   trace_bits = (u8 *)MapViewOfFile(
     shm_handle,          // handle to map object
@@ -2202,265 +2194,64 @@ char *argv_to_cmd(char** argv) {
 }
 
 /*Initialazing overlapped structure and connecting*/
-static BOOL OverlappedConnectNamedPipe(HANDLE pipe_h, LPOVERLAPPED overlapped)
+static BOOL CreateOverlapped(void)
 {
-	ZeroMemory(overlapped, sizeof(*overlapped));
+	ZeroMemory(&pipe_overlapped, sizeof(pipe_overlapped));
 	
-	overlapped->hEvent = CreateEvent(
+	pipe_overlapped.hEvent = CreateEvent(
 		NULL,    // default security attribute 
 		TRUE,    // manual-reset event 
 		TRUE,    // initial state = signaled 
 		NULL);   // unnamed event object 
 
-	if (overlapped->hEvent == NULL)
+	if (pipe_overlapped.hEvent == NULL)
 	{
 		return FALSE;
 	}
-
-	if (ConnectNamedPipe(pipe_h, overlapped))
-	{
-		return FALSE;
-	}
-	switch (GetLastError())
-	{
-		// The overlapped connection in progress. 
-	case ERROR_IO_PENDING:
-		WaitForSingleObject(overlapped->hEvent, INFINITE);
-		return TRUE;
-		// Client is already connected
-	case ERROR_PIPE_CONNECTED:
-		return TRUE;
-	default:
-	{
-		return FALSE;
-	}
-	}
+	return TRUE;
 }
 
-static void create_target_process(char** argv) {
-  char *cmd;
-  char *pipe_name;
-  char *buf;
-  char *pidfile;
-  FILE *fp;
-  size_t pidsize;
-  BOOL inherit_handles = TRUE;
+void setup_ipc(void) {
 
-  HANDLE hJob = NULL;
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limit;
-  STARTUPINFO si;
-  PROCESS_INFORMATION pi;
+  /* open existed pipe */
+  pipe_sync_handle = CreateFile(
+         "\\\\.\\pipe\\afl_sync",   // pipe name
+         GENERIC_READ |  // read and write access
+         GENERIC_WRITE,
+         0,              // no sharing
+         NULL,           // default security attributes
+         OPEN_EXISTING,  // opens existing pipe
+         0,              // default attributes
+         NULL);          // no template file
 
-  pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
-
-  pipe_handle = CreateNamedPipe(
-    pipe_name,                // pipe name
-	PIPE_ACCESS_DUPLEX |     // read/write access 
-	FILE_FLAG_OVERLAPPED,    // overlapped mode 
-    0,
-    1,                        // max. instances
-    512,                      // output buffer size
-    512,                      // input buffer size
-    20000,                    // client time-out
-    NULL);                    // default security attribute
-
-  if (pipe_handle == INVALID_HANDLE_VALUE) {
-    FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+  if (pipe_sync_handle == INVALID_HANDLE_VALUE) {
+    FATAL("CreateFile failed, GLE=%d.\n", GetLastError());
   }
 
-  target_cmd = argv_to_cmd(argv);
+  CreateOverlapped();
 
-  ZeroMemory(&si, sizeof(si));
-  si.cb = sizeof(si);
-  ZeroMemory(&pi, sizeof(pi));
+  /* open existed shared memory */
+  setup_shm();
 
-  if(sinkhole_stds) {
-    si.hStdOutput = si.hStdError = devnul_handle;
-    si.dwFlags |= STARTF_USESTDHANDLES;
-  } else {
-    inherit_handles = FALSE;
-  }
+  /* open existed pipe */
+  pipe_data_handle = CreateFile(
+         "\\\\.\\pipe\\afl_data",   // pipe name
+         GENERIC_READ |             // read and write access
+         GENERIC_WRITE,
+         0,                         // no sharing
+         NULL,                      // default security attributes
+         OPEN_EXISTING,             // opens existing pipe
+         0,                         // default attributes
+         NULL);                     // no template file
 
-  if(drioless) {
-    char *static_config = alloc_printf("%s:%d", fuzzer_id, fuzz_iterations_max);
+  if (pipe_data_handle == INVALID_HANDLE_VALUE) {
+    FATAL("CreateFile failed, GLE=%d.\n", GetLastError());
+  };
 
-    if (static_config == NULL) {
-      FATAL("Cannot allocate static_config.");
-    }
-
-    SetEnvironmentVariable("AFL_STATIC_CONFIG", static_config);
-    cmd = alloc_printf("%s", target_cmd);
-    ck_free(static_config);
-  } else {
-    pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
-	if (persist_dr_cache) {
-		cmd = alloc_printf(
-			"%s\\drrun.exe -pidfile %s -no_follow_children -persist -persist_dir \"%s\\drcache\" -c winafl.dll %s -fuzzer_id %s -drpersist -- %s",
-			dynamorio_dir, pidfile, out_dir, client_params, fuzzer_id, target_cmd);
-	} else {
-		cmd = alloc_printf(
-			"%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzzer_id %s -- %s",
-			dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd);
-	}
-  }
-  if(mem_limit || cpu_aff) {
-    hJob = CreateJobObject(NULL, NULL);
-    if(hJob == NULL) {
-      FATAL("CreateJobObject failed, GLE=%d.\n", GetLastError());
-    }
-
-    ZeroMemory(&job_limit, sizeof(job_limit));
-    if (mem_limit) {
-      job_limit.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-      job_limit.ProcessMemoryLimit = mem_limit * 1024 * 1024;
-    }
-	
-    if (cpu_aff) {
-      job_limit.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY;
-      job_limit.BasicLimitInformation.Affinity = (DWORD_PTR)cpu_aff;
-    }
-
-    if(!SetInformationJobObject(
-      hJob,
-      JobObjectExtendedLimitInformation,
-      &job_limit,
-      sizeof(job_limit)
-    )) {
-      FATAL("SetInformationJobObject failed, GLE=%d.\n", GetLastError());
-    }
-  }
-
-  if(!CreateProcess(NULL, cmd, NULL, NULL, inherit_handles, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
-    FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
-  }
-
-  child_handle = pi.hProcess;
-  child_thread_handle = pi.hThread;
-
-  if(mem_limit || cpu_aff) {
-    if(!AssignProcessToJobObject(hJob, child_handle)) {
-      FATAL("AssignProcessToJobObject failed, GLE=%d.\n", GetLastError());
-    }
-  }
-
-  ResumeThread(child_thread_handle);
-
-  watchdog_timeout_time = get_cur_time() + exec_tmout;
-  watchdog_enabled = 1;
-
-  if(!OverlappedConnectNamedPipe(pipe_handle, &pipe_overlapped)) {
-      FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
-  }
-
-  watchdog_enabled = 0;
-
-  if(drioless == 0) {
-    //by the time pipe has connected the pidfile must have been created
-    fp = fopen(pidfile, "rb");
-    if(!fp) {
-      FATAL("Error opening pidfile.txt");
-    }
-    fseek(fp,0,SEEK_END);
-    pidsize = ftell(fp);
-    fseek(fp,0,SEEK_SET);
-    buf = (char *)malloc(pidsize+1);
-    fread(buf, pidsize, 1, fp);
-    buf[pidsize] = 0;
-    fclose(fp);
-    remove(pidfile);
-    child_pid = atoi(buf);
-    free(buf);
-    ck_free(pidfile);
-  }
-  else {
-    child_pid = pi.dwProcessId;
-  }
-
-  ck_free(target_cmd);
-  ck_free(cmd);
-  ck_free(pipe_name);
 }
-
 
 static void destroy_target_process(int wait_exit) {
-	char* kill_cmd;
-	BOOL still_alive = TRUE;
-	STARTUPINFO si;
-	PROCESS_INFORMATION pi;
 
-	EnterCriticalSection(&critical_section);
-
-	if (!child_handle) {
-		goto leave;
-	}
-
-	if (WaitForSingleObject(child_handle, wait_exit) != WAIT_TIMEOUT) {
-		goto done;
-	}
-
-	// nudge the child process only if dynamorio is used
-	if (drioless) {
-		TerminateProcess(child_handle, 0);
-	}
-	else {
-		kill_cmd = alloc_printf("%s\\drconfig.exe -nudge_pid %d 0 1", dynamorio_dir, child_pid);
-
-		ZeroMemory(&si, sizeof(si));
-		si.cb = sizeof(si);
-		ZeroMemory(&pi, sizeof(pi));
-
-		if (!CreateProcess(NULL, kill_cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-			FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
-		}
-
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-
-		ck_free(kill_cmd);
-	}
-
-	still_alive = WaitForSingleObject(child_handle, 2000) == WAIT_TIMEOUT;
-
-	if (still_alive) {
-		//wait until the child process exits
-		ZeroMemory(&si, sizeof(si));
-		si.cb = sizeof(si);
-		ZeroMemory(&pi, sizeof(pi));
-
-		kill_cmd = alloc_printf("taskkill /PID %d /F", child_pid);
-
-		if (!CreateProcess(NULL, kill_cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-			FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
-		}
-
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-
-		ck_free(kill_cmd);
-
-		if (WaitForSingleObject(child_handle, 20000) == WAIT_TIMEOUT) {
-			FATAL("Cannot kill child process\n");
-		}
-	}
-
-done:
-	CloseHandle(child_handle);
-	CloseHandle(child_thread_handle);
-
-	child_handle = NULL;
-	child_thread_handle = NULL;
-
-leave:
-	//close the pipe
-	if (pipe_handle) {
-		DisconnectNamedPipe(pipe_handle);
-		CloseHandle(pipe_handle);
-		CloseHandle(pipe_overlapped.hEvent);
-
-		pipe_handle = NULL;
-	}
-
-	LeaveCriticalSection(&critical_section);
 }
 
 DWORD WINAPI watchdog_timer( LPVOID lpParam ) {
@@ -2477,48 +2268,41 @@ DWORD WINAPI watchdog_timer( LPVOID lpParam ) {
 char ReadCommandFromPipe(u32 timeout)
 {
 	DWORD num_read;
-	char result = 0;
-	if (!is_child_running())
-	{
-		return 0;
-	}
+  char result = 0;
 
-	if (ReadFile(pipe_handle, &result, 1, &num_read, &pipe_overlapped) || GetLastError() == ERROR_IO_PENDING)
-	{
-		//ACTF("ReadFile success or GLE IO_PENDING", result);
-		if (WaitForSingleObject(pipe_overlapped.hEvent, timeout) != WAIT_OBJECT_0) {
-			// took longer than specified timeout or other error - cancel read
-			CancelIo(pipe_handle);
-			WaitForSingleObject(pipe_overlapped.hEvent, INFINITE); //wait for cancelation to finish properly.
-			result = 0;
-		}
-	}
-	//ACTF("ReadFile GLE %d", GetLastError());
-	//ACTF("read from pipe '%c'", result);
-	return result;
+  if (ReadFile(pipe_sync_handle, &result, 1, &num_read, &pipe_overlapped) || GetLastError() == ERROR_IO_PENDING)
+  {
+    if (WaitForSingleObject(pipe_overlapped.hEvent, timeout) != WAIT_OBJECT_0) {
+      // took longer than specified timeout or other error - cancel read
+      CancelIo(pipe_sync_handle);
+      WaitForSingleObject(pipe_overlapped.hEvent, INFINITE); //wait for cancelation to finish properly.
+      result = 0;
+    }
+  }
+
+  //ACTF("ReadFile GLE %d", GetLastError());
+  //ACTF("read from pipe '%c'", result);
+  return result;
 }
 
 void WriteCommandToPipe(char cmd)
 {
 	DWORD num_written;
 	//ACTF("write to pipe '%c'", cmd);
-	WriteFile(pipe_handle, &cmd, 1, &num_written, &pipe_overlapped);
+	WriteFile(pipe_sync_handle, &cmd, 1, &num_written, &pipe_overlapped);
+}
+
+void WriteDataToPipe(void* mem, u32 len)
+{
+  DWORD num_written;
+  WriteFile(pipe_data_handle, mem, len, &num_written, NULL);
+//  SAYF("[debug] wrote %d bytes\n", num_written);
 }
 
 static void setup_watchdog_timer() {
 	watchdog_enabled = 0;
 	InitializeCriticalSection(&critical_section);
 	CreateThread(NULL, 0, watchdog_timer, 0, 0, NULL);
-}
-
-static int is_child_running() {
-  int ret;
-
-  EnterCriticalSection(&critical_section);
-  ret = (child_handle && (WaitForSingleObject(child_handle, 0 ) == WAIT_TIMEOUT));
-  LeaveCriticalSection(&critical_section);
-
-  return ret;
 }
 
 //Define the function prototypes
@@ -2567,98 +2351,23 @@ static int process_test_case_into_dll(int fuzz_iterations)
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
-static u8 run_target(char** argv, u32 timeout) {
+static u8 run_target(char** argv, u32 timeout, void* mem, u32 len) {
   //todo watchdog timer to detect hangs
-  DWORD num_read, dwThreadId;
   char result = 0;
 
-  if(sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
-    devnul_handle = CreateFile(
-        "nul",
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL);
-
-    if(devnul_handle == INVALID_HANDLE_VALUE) {
-      PFATAL("Unable to open the nul device.");
-    }
-  }
-
-  if (custom_dll_defined) {
-    if (!dll_init_ptr())
-      PFATAL("User-defined custom initialization routine returned 0");
-  }
-
-  if(!is_child_running()) {
-    destroy_target_process(0);
-    create_target_process(argv);
-    fuzz_iterations_current = 0;
-  }
-
-  if (custom_dll_defined)
-    process_test_case_into_dll(fuzz_iterations_current);
-
-  child_timed_out = 0;
+  total_execs++;
   memset(trace_bits, 0, MAP_SIZE);
-  MemoryBarrier();
-  if (fuzz_iterations_current == 0 && init_tmout != 0) {
-	  watchdog_timeout_time = get_cur_time() + init_tmout;
-  }
-  else {
-	  watchdog_timeout_time = get_cur_time() + timeout;
-  }
-  watchdog_enabled = 1;
-  result = ReadCommandFromPipe(timeout);
-  if (result == 'K')
+  WriteDataToPipe(mem, len);
+  result = ReadCommandFromPipe(timeout); /* WAIT */
+  switch(result)
   {
-	  //a workaround for first cycle in app persistent mode
-	  result = ReadCommandFromPipe(timeout);
-  }
-  if (result == 0) 
-  {
-	  //saves us from getting stuck in corner case.
-	  MemoryBarrier();
-	  watchdog_enabled = 0;
-
-      destroy_target_process(0);
+    case 'K':
+      return FAULT_NONE;
+    case 'C':
+      return FAULT_CRASH;
+    default:
       return FAULT_TMOUT;
   }
-  if (result != 'P')
-  {
-	  FATAL("Unexpected result from pipe! expected 'P', instead received '%c'\n", result);
-  }
-  WriteCommandToPipe('F');
-
-  result = ReadCommandFromPipe(timeout); //no need to check for "error(0)" since we are exiting anyway
-  //ACTF("result: '%c'", result);
-  MemoryBarrier();
-  watchdog_enabled = 0;
-
-#ifdef __x86_64__
-  classify_counts((u64*)trace_bits);
-#else
-  classify_counts((u32*)trace_bits);
-#endif /* ^__x86_64__ */
-
-  total_execs++;
-  fuzz_iterations_current++;
-
-  if(fuzz_iterations_current == fuzz_iterations_max) {
-	  destroy_target_process(2000);
-  }
-
-  if (result == 'K') return FAULT_NONE;
-
-  if (result == 'C') {
-	  destroy_target_process(2000);
-	  return FAULT_CRASH;
-  }
-
-  destroy_target_process(0);
-  return FAULT_TMOUT;
 }
 
 
@@ -2759,9 +2468,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
 
-    write_to_testcase(use_mem, q->len);
-
-    fault = run_target(argv, use_tmout);
+    fault = run_target(argv, use_tmout, use_mem, q->len);
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
@@ -3363,8 +3070,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       if (exec_tmout < hang_tmout) {
 
         u8 new_fault;
-        write_to_testcase(mem, len);
-        new_fault = run_target(argv, hang_tmout);
+        new_fault = run_target(argv, hang_tmout, mem, len);
 
         if (stop_soon || new_fault != FAULT_TMOUT) return keeping;
 
@@ -4656,9 +4362,7 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
       u32 trim_avail = MIN(remove_len, q->len - remove_pos);
       u32 cksum;
 
-      write_with_gap(in_buf, q->len, remove_pos, trim_avail);
-
-      fault = run_target(argv, exec_tmout);
+      fault = run_target(argv, exec_tmout, in_buf, q->len);
       trim_execs++;
 
       if (stop_soon || fault == FAULT_ERROR) goto abort_trimming;
@@ -4751,9 +4455,7 @@ static u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   }
 
-  write_to_testcase(out_buf, len);
-
-  fault = run_target(argv, exec_tmout);
+  fault = run_target(argv, exec_tmout, out_buf, len);
 
   if (stop_soon) return 1;
 
@@ -5140,7 +4842,7 @@ static u8 fuzz_one(char** argv) {
 
 #endif /* ^IGNORE_FINDS */
 
-  if (not_on_tty)
+  if (0 && not_on_tty)
     ACTF("Fuzzing test case #%u (%u total)...", current_entry, queued_paths);
 
   /* Map the test case into memory. */
@@ -6881,9 +6583,7 @@ static void sync_fuzzers(char** argv) {
         /* See what happens. We rely on save_if_interesting() to catch major
            errors and save the test case. */
 
-        write_to_testcase(mem, st.st_size);
-
-        fault = run_target(argv, exec_tmout);
+        fault = run_target(argv, exec_tmout, mem, st.st_size);
 
         if (stop_soon) return;
 
@@ -7541,57 +7241,6 @@ static void save_cmdline(u32 argc, char** argv) {
 static int optind;
 static char *optarg;
 
-static void extract_client_params(u32 argc, char** argv) {
-  u32 len = 1, i;
-  u32 nclientargs = 0;
-  u8* buf;
-  u32 opt_start, opt_end;
-
-  if(!argv[optind] || optind >= argc) usage(argv[0]);
-  if(strcmp(argv[optind],"--")) usage(argv[0]);
-
-  optind++;
-  opt_start = optind;
-
-  for (i = optind; i < argc; i++) {
-    if(strcmp(argv[i],"--") == 0) break;
-    nclientargs++;
-    len += strlen(argv[i]) + 1;
-  }
-
-  if(i == argc) usage(argv[0]);
-  opt_end = i;
-
-  buf = client_params = ck_alloc(len);
-
-  for (i = opt_start; i < opt_end; i++) {
-
-    u32 l = strlen(argv[i]);
-
-    memcpy(buf, argv[i], l);
-    buf += l;
-
-    *(buf++) = ' ';
-  }
-
-  if(buf != client_params) {
-    buf--;
-  }
-
-  *buf = 0;
-
-  optind = opt_end;
-
-  //extract the number of fuzz iterations from client params
-  fuzz_iterations_max = 1000;
-  for (i = opt_start; i < opt_end; i++) {
-    if((strcmp(argv[i], "-fuzz_iterations") == 0) && ((i + 1) < opt_end)) {
-      fuzz_iterations_max = atoi(argv[i+1]);
-    }
-  }
-
-}
-
 
 //extracts client and target command line params
 /*static void parse_cmd_line(char *argv0) {
@@ -7695,10 +7344,9 @@ int main(int argc, char** argv) {
 
   in_dir = NULL;
   out_dir = NULL;
-  dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:dYnCB:S:M:x:QD:b:l:p")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:dYnCB:S:M:x:Qb:l:p")) > 0)
 
     switch (opt) {
       case 'i':
@@ -7714,12 +7362,6 @@ int main(int argc, char** argv) {
 
         if (out_dir) FATAL("Multiple -o options not supported");
         out_dir = optarg;
-        break;
-
-      case 'D': /* dynamorio dir */
-
-        if (dynamorio_dir) FATAL("Multiple -D options not supported");
-        dynamorio_dir = optarg;
         break;
 
       case 'M': { /* master sync ID */
@@ -7879,7 +7521,6 @@ int main(int argc, char** argv) {
 
       case 'Y':
 
-        if (dynamorio_dir) FATAL("Dynamic-instrumentation via DRIO is uncompatible with static-instrumentation");
         drioless = 1;
 
         break;
@@ -7901,9 +7542,8 @@ int main(int argc, char** argv) {
 
     }
 
-  if (!in_dir || !out_dir || !timeout_given || (!drioless && !dynamorio_dir)) usage(argv[0]);
+  if (!in_dir || !out_dir || !timeout_given) usage(argv[0]);
 
-  extract_client_params(argc, argv);
   optind++;
 
   setup_signal_handlers();
@@ -7944,10 +7584,9 @@ int main(int argc, char** argv) {
   check_cpu_governor();
 
   setup_post();
-  setup_shm();
+  setup_ipc();
   init_count_class16();
   child_handle = NULL;
-  pipe_handle = NULL;
 
   devnul_handle = INVALID_HANDLE_VALUE;
 
@@ -8010,7 +7649,7 @@ int main(int argc, char** argv) {
 
       show_stats();
 
-      if (not_on_tty) {
+      if (0 && not_on_tty) {
         ACTF("Entering queue cycle %llu.", queue_cycle);
         fflush(stdout);
       }
